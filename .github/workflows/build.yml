@@ -1,0 +1,175 @@
+name: Build and Publish just-container
+
+on:
+  schedule:
+    - cron: "0 6 1 * *"  # Monthly: 1st of each month at 06:00 UTC
+  workflow_dispatch:
+    inputs:
+      force_rebuild:
+        description: "Force rebuild even if the image already exists"
+        type: boolean
+        default: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/just-container
+
+jobs:
+  get-version:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.get.outputs.version }}
+    steps:
+      - name: Get latest just release version
+        id: get
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION=$(gh api repos/casey/just/releases/latest --jq '.tag_name')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Latest just version: $VERSION"
+
+  check-exists:
+    runs-on: ubuntu-24.04
+    needs: get-version
+    permissions:
+      packages: read
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+    steps:
+      - name: Check if image already exists
+        id: check
+        env:
+          VERSION: ${{ needs.get-version.outputs.version }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "${{ inputs.force_rebuild }}" = "true" ]; then
+            echo "Force rebuild requested — skipping existence check"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          TOKEN=$(echo -n "$GITHUB_TOKEN" | base64)
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer $TOKEN" \
+            "https://ghcr.io/v2/${{ env.IMAGE_NAME }}/manifests/${VERSION}")
+
+          echo "Registry manifest check HTTP status: $HTTP_STATUS"
+
+          if [ "$HTTP_STATUS" = "200" ]; then
+            echo "Image ${{ env.IMAGE_NAME }}:${VERSION} already exists — skipping build"
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Image not found — will build and push"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    runs-on: ${{ matrix.runner }}
+    needs: [get-version, check-exists]
+    if: needs.check-exists.outputs.should_build == 'true'
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          push: true
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true
+          build-args: |
+            JUST_VERSION=${{ needs.get-version.outputs.version }}
+          cache-from: type=gha,scope=${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.runner }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    runs-on: ubuntu-24.04
+    needs: [get-version, build]
+    permissions:
+      packages: write
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Create and push manifest
+        env:
+          VERSION: ${{ needs.get-version.outputs.version }}
+        run: |
+          docker buildx imagetools create \
+            --tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${VERSION} \
+            --tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
+            $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
+        working-directory: /tmp/digests
+
+      - name: Write job summary
+        env:
+          VERSION: ${{ needs.get-version.outputs.version }}
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          ## just-container published
+
+          **Version:** \`${VERSION}\`
+
+          **Tags pushed:**
+          - \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${VERSION}\`
+          - \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest\`
+
+          **Platforms:** \`linux/amd64\`, \`linux/arm64\`
+
+          ### Usage
+
+          \`\`\`dockerfile
+          COPY --from=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${VERSION} /usr/local/bin/just /usr/local/bin/just
+          \`\`\`
+          EOF
